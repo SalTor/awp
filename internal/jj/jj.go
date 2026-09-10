@@ -255,6 +255,23 @@ func (c *Client) WorkspaceRevision(name string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// WorkspaceParentCommitID returns the full commit id of the parent of the
+// named workspace's working-copy commit, which is the commit Git's HEAD
+// points at for that workspace. A merge working copy has several parents;
+// the first is returned, matching what jj exports.
+func (c *Client) WorkspaceParentCommitID(name string) (string, error) {
+	out, err := c.runner.Run(context.Background(), "", "jj", "--ignore-working-copy", "log", "-r", name+"@-", "--no-graph", "-T", "commit_id ++ \"\\n\"")
+	if err != nil {
+		return "", formatCommandError(fmt.Sprintf("resolve parent commit for workspace %q", name), err, out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return line, nil
+		}
+	}
+	return "", nil
+}
+
 // HeadDescription returns the working-copy commit's short change-id and
 // first description line at dir, tab-separated in the underlying jj
 // call. --ignore-working-copy skips the snapshot pass so this is safe to

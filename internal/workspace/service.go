@@ -76,6 +76,7 @@ type JJClient interface {
 	RenameWorkspace(path string, newName string) error
 	ForgetWorkspace(name string) error
 	WorkspaceRevision(name string) (string, error)
+	WorkspaceParentCommitID(name string) (string, error)
 	BookmarksAtRevision(revision string) ([]string, error)
 	Trunk() (string, error)
 	ForgetBookmark(name string) error
@@ -500,7 +501,7 @@ func (s *service) prepareWorkspaceInternal(name string, bookmark string, runHook
 	// Step 5: builtin bootstrap (project rc loading, etc.). Idempotent
 	// — runs on every reconcile because its body is cheap and may pick
 	// up newly-added config.
-	if err := s.runBuiltinBootstrap(repoRoot, entry.Path); err != nil {
+	if err := s.runBuiltinBootstrap(repoRoot, entry.Path, normalized); err != nil {
 		return "", "", existedBefore, err
 	}
 
@@ -608,7 +609,7 @@ func (s *service) createWorkspace(name string, bookmark string, prompt string, r
 	if err := s.store.Save(repoRoot, entries); err != nil {
 		return err
 	}
-	if err := s.runBuiltinBootstrap(repoRoot, workspacePath); err != nil {
+	if err := s.runBuiltinBootstrap(repoRoot, workspacePath, normalized); err != nil {
 		return err
 	}
 	if runHooks {
@@ -1069,6 +1070,7 @@ func (s *service) removeWorkspaceTree(path, sourceRepo string) bool {
 	// Unlink a .awp symlink before the recursive remove so the walk can
 	// never follow it into the shared source .awp.
 	unlinkAwpSymlink(path)
+	s.unregisterGitWorktree(path, sourceRepo)
 	if err := os.RemoveAll(path); err != nil {
 		s.logf("⚠️ Could not remove workspace directory %q: %v", path, err)
 		return false
@@ -1272,7 +1274,7 @@ func (s *service) Bootstrap(name string) error {
 	}
 
 	s.logf("▶️ Bootstrapping workspace %q (path=%s, root=%s)", workspaceName, workspacePath, sourceRepo)
-	if err := s.runBuiltinBootstrap(sourceRepo, workspacePath); err != nil {
+	if err := s.runBuiltinBootstrap(sourceRepo, workspacePath, workspaceName); err != nil {
 		return err
 	}
 	return s.runPostWorkspaceStartHooksWithRoot(sourceRepo, workspaceName, workspacePath, sourceRepo)
@@ -1308,7 +1310,7 @@ func (s *service) BootstrapAll() error {
 	for _, name := range names {
 		entry := entries[name]
 		s.logf("▶️ Bootstrapping workspace %q (path=%s)", name, entry.Path)
-		if err := s.runBuiltinBootstrap(sourceRepo, entry.Path); err != nil {
+		if err := s.runBuiltinBootstrap(sourceRepo, entry.Path, name); err != nil {
 			s.logf("❌ Built-in bootstrap failed for %q: %v", name, err)
 			failed = append(failed, name)
 			if firstErr == nil {
@@ -1335,7 +1337,7 @@ func (s *service) BootstrapAll() error {
 // runBuiltinBootstrap copies files from the source repo that external tools
 // (gh, git) expect to find inside a workspace. Runs before any user hooks.
 // Silently skips pieces that don't exist in the source repo.
-func (s *service) runBuiltinBootstrap(sourceRepo, workspacePath string) error {
+func (s *service) runBuiltinBootstrap(sourceRepo, workspacePath, workspaceName string) error {
 	if strings.TrimSpace(sourceRepo) == "" || strings.TrimSpace(workspacePath) == "" {
 		return nil
 	}
@@ -1344,27 +1346,8 @@ func (s *service) runBuiltinBootstrap(sourceRepo, workspacePath string) error {
 	}
 	s.logf("▶️ Running built-in bootstrap")
 
-	gitSrc := filepath.Join(sourceRepo, ".git")
-	if st, err := os.Stat(gitSrc); err == nil {
-		var gitdirTarget string
-		if st.IsDir() {
-			gitdirTarget = gitSrc
-		} else if data, readErr := os.ReadFile(gitSrc); readErr == nil {
-			raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "gitdir:"))
-			if !filepath.IsAbs(raw) {
-				raw = filepath.Join(sourceRepo, raw)
-			}
-			gitdirTarget = filepath.Clean(raw)
-		}
-		if gitdirTarget != "" {
-			gitDst := filepath.Join(workspacePath, ".git")
-			_ = os.RemoveAll(gitDst)
-			content := fmt.Sprintf("gitdir: %s\n", gitdirTarget)
-			if err := os.WriteFile(gitDst, []byte(content), 0o644); err != nil {
-				return fmt.Errorf("write .git gitfile: %w", err)
-			}
-			s.logf("✅ Wrote .git gitfile → %s", gitdirTarget)
-		}
+	if err := s.linkGitWorktree(sourceRepo, workspacePath, workspaceName); err != nil {
+		return err
 	}
 
 	awpSrc := filepath.Join(sourceRepo, ".awp")
@@ -1399,6 +1382,161 @@ func sameDir(a, b string) bool {
 		return false
 	}
 	return filepath.Clean(aa) == filepath.Clean(bb)
+}
+
+// gitCommonDir resolves the Git directory shared by a repo and all its
+// worktrees, following a gitfile and then a worktree's commondir pointer.
+// Reports false when the checkout has no Git directory at all.
+func gitCommonDir(repoRoot string) (string, bool) {
+	gitPath := filepath.Join(repoRoot, ".git")
+	st, err := os.Stat(gitPath)
+	if err != nil {
+		return "", false
+	}
+	dir := gitPath
+	if !st.IsDir() {
+		target, ok := readGitfile(gitPath, repoRoot)
+		if !ok {
+			return "", false
+		}
+		dir = target
+	}
+	// Only a worktree's Git directory carries commondir; the main
+	// checkout's is already the shared one.
+	if data, err := os.ReadFile(filepath.Join(dir, "commondir")); err == nil {
+		if raw := strings.TrimSpace(string(data)); raw != "" {
+			if !filepath.IsAbs(raw) {
+				raw = filepath.Join(dir, raw)
+			}
+			dir = filepath.Clean(raw)
+		}
+	}
+	return dir, true
+}
+
+// readGitfile resolves the target of a `gitdir:` pointer file, taking a
+// relative target as relative to base.
+func readGitfile(path, base string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "gitdir:"))
+	if raw == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(raw) {
+		raw = filepath.Join(base, raw)
+	}
+	return filepath.Clean(raw), true
+}
+
+// linkGitWorktree registers a workspace as a Git worktree of the source
+// repo, so `git` and `gh` run inside it resolve to a HEAD and an index of
+// that workspace's own.
+//
+// The workspace's gitfile must not point straight at the shared Git
+// directory, which is what awp did before: that hands every jj workspace
+// the one HEAD file. jj 0.45 tracks Git HEAD per workspace, so a workspace
+// reading that shared file finds the commit some other workspace checked
+// out, takes it for an external `git checkout`, and moves its own working
+// copy onto a fresh commit there.
+func (s *service) linkGitWorktree(sourceRepo, workspacePath, workspaceName string) error {
+	commonDir, ok := gitCommonDir(sourceRepo)
+	if !ok {
+		return nil
+	}
+	name := strings.TrimSpace(workspaceName)
+	if name == "" {
+		name = filepath.Base(workspacePath)
+	}
+	wtDir := filepath.Join(commonDir, "worktrees", name)
+	if err := os.MkdirAll(wtDir, 0o755); err != nil {
+		return fmt.Errorf("create git worktree dir: %w", err)
+	}
+	gitDst := filepath.Join(workspacePath, ".git")
+	commonRel, err := filepath.Rel(wtDir, commonDir)
+	if err != nil {
+		commonRel = commonDir
+	}
+	// Pure pointers, rewritten on every bootstrap so a moved repo or a
+	// renamed workspace heals itself.
+	for file, content := range map[string]string{"commondir": commonRel, "gitdir": gitDst} {
+		if err := os.WriteFile(filepath.Join(wtDir, file), []byte(content+"\n"), 0o644); err != nil {
+			return fmt.Errorf("write git worktree %s: %w", file, err)
+		}
+	}
+	if err := s.seedWorktreeHead(wtDir, name); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(gitDst); err != nil {
+		return fmt.Errorf("replace .git gitfile: %w", err)
+	}
+	if err := os.WriteFile(gitDst, []byte(fmt.Sprintf("gitdir: %s\n", wtDir)), 0o644); err != nil {
+		return fmt.Errorf("write .git gitfile: %w", err)
+	}
+	s.logf("✅ Registered git worktree → %s", wtDir)
+	return nil
+}
+
+// seedWorktreeHead gives a new worktree its first HEAD and then leaves the
+// file alone, because from the workspace's first jj command onward it is
+// jj's to maintain.
+//
+// The seed has to be the workspace's own parent commit. Seeding it from the
+// source checkout's HEAD is the failure this whole arrangement exists to
+// avoid: jj reads it, concludes the workspace was checked out onto that
+// commit, and rewrites the working copy there. When the commit cannot be
+// resolved, no HEAD is better than a wrong one — jj ignores a worktree with
+// no HEAD, and only Git tooling inside the workspace pays for it.
+func (s *service) seedWorktreeHead(wtDir, workspaceName string) error {
+	headPath := filepath.Join(wtDir, "HEAD")
+	if _, err := os.Stat(headPath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat git worktree HEAD: %w", err)
+	}
+	if s.jj == nil {
+		return nil
+	}
+	commit, err := s.jj.WorkspaceParentCommitID(workspaceName)
+	if err != nil {
+		s.logf("⚠️ Leaving git worktree HEAD unset for %q: %v", workspaceName, err)
+		return nil
+	}
+	if commit = strings.TrimSpace(commit); commit == "" {
+		return nil
+	}
+	if err := os.WriteFile(headPath, []byte(commit+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write git worktree HEAD: %w", err)
+	}
+	return nil
+}
+
+// unregisterGitWorktree drops the Git worktree metadata a workspace was
+// bootstrapped with. Must run before the workspace directory goes away,
+// since the gitfile inside it is what names the metadata to remove.
+func (s *service) unregisterGitWorktree(path, sourceRepo string) {
+	commonDir, ok := gitCommonDir(sourceRepo)
+	if !ok {
+		return
+	}
+	wtDir, ok := readGitfile(filepath.Join(path, ".git"), path)
+	if !ok {
+		return
+	}
+	// Remove only something sitting directly under the shared worktrees
+	// directory. A workspace bootstrapped by an older awp points at the
+	// shared Git directory itself, and removing that destroys the repo.
+	if filepath.Dir(wtDir) != filepath.Join(commonDir, "worktrees") {
+		s.logf("⏭️ Skipped git worktree cleanup (%q is not worktree metadata)", wtDir)
+		return
+	}
+	if err := os.RemoveAll(wtDir); err != nil {
+		s.logf("⚠️ Could not remove git worktree metadata %q: %v", wtDir, err)
+		return
+	}
+	s.logf("✅ Removed git worktree metadata %q", wtDir)
 }
 
 func (s *service) trackBookmark(bookmark string) error {
@@ -1545,6 +1683,7 @@ func (s *service) rollbackNewWorkspaceStart(repoRoot, name, path string) error {
 	}
 
 	if s.isUnderManagedWorkspaceBase(path) {
+		s.unregisterGitWorktree(path, repoRoot)
 		if err := os.RemoveAll(path); err != nil {
 			errs = append(errs, fmt.Errorf("remove workspace path %q: %w", path, err))
 		}

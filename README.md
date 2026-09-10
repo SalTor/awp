@@ -296,6 +296,10 @@ Shell commands run after a workspace's jj layout exists but before the agent sta
 
 > Built-in bootstrap **symlinks** `<repo>/.awp/` into each workspace rather than copying it, so config edits propagate across all workspaces immediately. Editing `<workspace>/.awp/config.json` writes through to the source repo.
 
+> Built-in bootstrap also registers each workspace as a **Git worktree** of the source repo: it writes `<repo>/.git/worktrees/<name>/` and points the workspace's `.git` file at that directory. This is what lets `git` and `gh` run inside a workspace, and it gives the workspace a HEAD and an index of its own. A workspace whose `.git` pointed straight at the shared `<repo>/.git` (how awp wrote it before) is converted on its next bootstrap, so `awp w bootstrap --all` migrates a repo in one pass. The metadata is removed when the workspace is deleted; anything left behind by an interrupted delete is cleared by `git worktree prune`.
+>
+> jj 0.45 tracks Git HEAD per workspace. Workspaces that share one HEAD file therefore each read whatever commit another workspace last checked out, take it for an external `git checkout`, and move their own working copy onto a fresh commit there. The per-workspace HEAD is what prevents that.
+
 ### `deck.project_roots`
 
 List of directories the deck's `o` (open) screen scans for projects. Tilde-expanded. The walker descends up to 4 levels and stops at any directory containing `.git` or `.jj`. Selecting a project summons (or creates) a tmux session named `[awp]<basename>__default` at that path and records a `default` workspace entry under that repo root in `~/.awp/workspace-state.json`, so the project appears in the deck on subsequent launches.

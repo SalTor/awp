@@ -87,6 +87,8 @@ type fakeJJ struct {
 	revisionLookupErr    error
 	newRevCalls          []newRevCall
 	newRevErr            error
+	workspaceParents     map[string]string
+	parentLookupErr      error
 }
 
 type newRevCall struct {
@@ -160,6 +162,16 @@ func (f *fakeJJ) WorkspaceRevision(name string) (string, error) {
 	}
 	if rev, ok := f.workspaceRevs[name]; ok {
 		return rev, nil
+	}
+	return "", nil
+}
+
+func (f *fakeJJ) WorkspaceParentCommitID(name string) (string, error) {
+	if f.parentLookupErr != nil {
+		return "", f.parentLookupErr
+	}
+	if commit, ok := f.workspaceParents[name]; ok {
+		return commit, nil
 	}
 	return "", nil
 }
@@ -1270,5 +1282,209 @@ func TestUpdateStatusUnreadLifecycle(t *testing.T) {
 	}
 	if got := store.entries["qa"]; !got.Unread {
 		t.Errorf("working should not clear Unread, got %+v", got)
+	}
+}
+
+// gitWorktreeFixture builds a colocated source repo plus an empty managed
+// workspace directory, and returns both paths.
+func gitWorktreeFixture(t *testing.T, home, sourceHead string) (sourceRepo, wsPath string) {
+	t.Helper()
+	sourceRepo = t.TempDir()
+	gitDir := filepath.Join(sourceRepo, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatalf("mkdir source .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte(sourceHead+"\n"), 0o644); err != nil {
+		t.Fatalf("write source HEAD: %v", err)
+	}
+	wsPath = filepath.Join(home, ".awp", "workspaces", "myrepo", "feature")
+	if err := os.MkdirAll(wsPath, 0o755); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	return sourceRepo, wsPath
+}
+
+func readTrimmed(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func bootstrapService(sourceRepo string, parents map[string]string) *service {
+	jj := &fakeJJ{repoRoot: sourceRepo, workspaceParents: parents}
+	return NewService(Dependencies{
+		JJ:    jj,
+		Tmux:  &fakeTmux{windows: map[string]bool{}},
+		Store: &fakeStore{entries: map[string]Entry{}},
+		Input: bytes.NewBuffer(nil),
+		Out:   io.Discard,
+	})
+}
+
+func TestBootstrapRegistersWorkspaceAsGitWorktree(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sourceRepo, wsPath := gitWorktreeFixture(t, home, "1111111111111111111111111111111111111111")
+
+	svc := bootstrapService(sourceRepo, map[string]string{"feature": "2222222222222222222222222222222222222222"})
+	if err := svc.runBuiltinBootstrap(sourceRepo, wsPath, "feature"); err != nil {
+		t.Fatalf("bootstrap returned error: %v", err)
+	}
+
+	wtDir := filepath.Join(sourceRepo, ".git", "worktrees", "feature")
+	if got, want := readTrimmed(t, filepath.Join(wsPath, ".git")), "gitdir: "+wtDir; got != want {
+		t.Errorf("workspace gitfile = %q, want %q", got, want)
+	}
+	if got, want := readTrimmed(t, filepath.Join(wtDir, "gitdir")), filepath.Join(wsPath, ".git"); got != want {
+		t.Errorf("worktree gitdir = %q, want %q", got, want)
+	}
+	if got, want := readTrimmed(t, filepath.Join(wtDir, "commondir")), filepath.Join("..", ".."); got != want {
+		t.Errorf("worktree commondir = %q, want %q", got, want)
+	}
+}
+
+// The workspace's HEAD must come from its own parent commit. Seeding it
+// from the source checkout's HEAD is what makes jj treat the workspace as
+// externally checked out and rewrite its working copy onto that commit.
+func TestBootstrapSeedsWorktreeHeadFromWorkspaceParent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	const sourceHead = "1111111111111111111111111111111111111111"
+	const wsParent = "2222222222222222222222222222222222222222"
+	sourceRepo, wsPath := gitWorktreeFixture(t, home, sourceHead)
+
+	svc := bootstrapService(sourceRepo, map[string]string{"feature": wsParent})
+	if err := svc.runBuiltinBootstrap(sourceRepo, wsPath, "feature"); err != nil {
+		t.Fatalf("bootstrap returned error: %v", err)
+	}
+
+	head := readTrimmed(t, filepath.Join(sourceRepo, ".git", "worktrees", "feature", "HEAD"))
+	if head == sourceHead {
+		t.Fatalf("worktree HEAD was seeded from the source checkout's HEAD (%s)", sourceHead)
+	}
+	if head != wsParent {
+		t.Errorf("worktree HEAD = %q, want the workspace's own parent %q", head, wsParent)
+	}
+	if got := readTrimmed(t, filepath.Join(sourceRepo, ".git", "HEAD")); got != sourceHead {
+		t.Errorf("source HEAD = %q, want it untouched at %q", got, sourceHead)
+	}
+}
+
+// After the workspace's first jj command the HEAD file is jj's to maintain,
+// so a re-bootstrap must leave it alone.
+func TestBootstrapKeepsExistingWorktreeHead(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sourceRepo, wsPath := gitWorktreeFixture(t, home, "1111111111111111111111111111111111111111")
+	const jjOwned = "3333333333333333333333333333333333333333"
+
+	wtDir := filepath.Join(sourceRepo, ".git", "worktrees", "feature")
+	if err := os.MkdirAll(wtDir, 0o755); err != nil {
+		t.Fatalf("mkdir worktree dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wtDir, "HEAD"), []byte(jjOwned+"\n"), 0o644); err != nil {
+		t.Fatalf("write worktree HEAD: %v", err)
+	}
+
+	svc := bootstrapService(sourceRepo, map[string]string{"feature": "2222222222222222222222222222222222222222"})
+	if err := svc.runBuiltinBootstrap(sourceRepo, wsPath, "feature"); err != nil {
+		t.Fatalf("bootstrap returned error: %v", err)
+	}
+
+	if got := readTrimmed(t, filepath.Join(wtDir, "HEAD")); got != jjOwned {
+		t.Errorf("worktree HEAD = %q, want it left at %q", got, jjOwned)
+	}
+}
+
+// A workspace bootstrapped by an older awp points straight at the shared
+// Git directory; reconciling it must convert it to worktree metadata.
+func TestBootstrapReplacesSharedGitfileWithWorktree(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sourceRepo, wsPath := gitWorktreeFixture(t, home, "1111111111111111111111111111111111111111")
+	shared := filepath.Join(sourceRepo, ".git")
+	if err := os.WriteFile(filepath.Join(wsPath, ".git"), []byte("gitdir: "+shared+"\n"), 0o644); err != nil {
+		t.Fatalf("write legacy gitfile: %v", err)
+	}
+
+	svc := bootstrapService(sourceRepo, map[string]string{"feature": "2222222222222222222222222222222222222222"})
+	if err := svc.runBuiltinBootstrap(sourceRepo, wsPath, "feature"); err != nil {
+		t.Fatalf("bootstrap returned error: %v", err)
+	}
+
+	want := "gitdir: " + filepath.Join(shared, "worktrees", "feature")
+	if got := readTrimmed(t, filepath.Join(wsPath, ".git")); got != want {
+		t.Errorf("workspace gitfile = %q, want %q", got, want)
+	}
+}
+
+func TestDeleteRemovesGitWorktreeMetadata(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sourceRepo, wsPath := gitWorktreeFixture(t, home, "1111111111111111111111111111111111111111")
+
+	svc := bootstrapService(sourceRepo, map[string]string{"feature": "2222222222222222222222222222222222222222"})
+	if err := svc.runBuiltinBootstrap(sourceRepo, wsPath, "feature"); err != nil {
+		t.Fatalf("bootstrap returned error: %v", err)
+	}
+	wtDir := filepath.Join(sourceRepo, ".git", "worktrees", "feature")
+	if _, err := os.Stat(wtDir); err != nil {
+		t.Fatalf("expected worktree metadata to exist: %v", err)
+	}
+
+	jj := &fakeJJ{
+		repoRoot:      sourceRepo,
+		existing:      map[string]bool{"feature": true},
+		workspaceRevs: map[string]string{"feature": "abc123"},
+	}
+	del := NewService(Dependencies{
+		JJ:    jj,
+		Tmux:  &fakeTmux{windows: map[string]bool{}},
+		Store: &fakeStore{entries: map[string]Entry{"feature": {Name: "feature", Path: wsPath}}},
+		Input: bytes.NewBuffer(nil),
+		Out:   io.Discard,
+	})
+	if err := del.Delete("feature", true); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+
+	if _, err := os.Stat(wtDir); !os.IsNotExist(err) {
+		t.Errorf("expected worktree metadata removed, stat err = %v", err)
+	}
+}
+
+// The cleanup follows the workspace's gitfile, so it must refuse to act on
+// a legacy one: that points at the shared Git directory, and removing it
+// would destroy the repository.
+func TestDeleteKeepsSharedGitDirForLegacyGitfile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sourceRepo, wsPath := gitWorktreeFixture(t, home, "1111111111111111111111111111111111111111")
+	shared := filepath.Join(sourceRepo, ".git")
+	if err := os.WriteFile(filepath.Join(wsPath, ".git"), []byte("gitdir: "+shared+"\n"), 0o644); err != nil {
+		t.Fatalf("write legacy gitfile: %v", err)
+	}
+
+	jj := &fakeJJ{
+		repoRoot:      sourceRepo,
+		existing:      map[string]bool{"feature": true},
+		workspaceRevs: map[string]string{"feature": "abc123"},
+	}
+	svc := NewService(Dependencies{
+		JJ:    jj,
+		Tmux:  &fakeTmux{windows: map[string]bool{}},
+		Store: &fakeStore{entries: map[string]Entry{"feature": {Name: "feature", Path: wsPath}}},
+		Input: bytes.NewBuffer(nil),
+		Out:   io.Discard,
+	})
+	if err := svc.Delete("feature", true); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(shared, "HEAD")); err != nil {
+		t.Fatalf("shared git dir must survive deleting a legacy workspace: %v", err)
 	}
 }
